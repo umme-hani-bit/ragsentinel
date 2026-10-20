@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: ragsentinel-db
+    environment:
+      POSTGRES_DB: ragsentinel
+      POSTGRES_USER: ragsentinel
+      POSTGRES_PASSWORD: ragsentinel
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build: ./services/api
+    container_name: ragsentinel-api
+    environment:
+      DATABASE_URL: postgresql://ragsentinel:ragsentinel@db:5432/ragsentinel
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+  streamlit:
+    build: ./services/streamlit
+    container_name: ragsentinel-streamlit
+    environment:
+      API_BASE_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
