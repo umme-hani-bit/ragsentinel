@@ -1,0 +1,23 @@
+tenants:
+  A:
+    users:
+      default:
+        capabilities: []
+  B:
+    users:
+      default:
+        capabilities: []
+  C:
+    users:
+      default:
+        capabilities: []
+tools:
+  email_send:
+    allowed_domains: []
+    rate_limit_per_minute: 0
+  http_post:
+    allowed_hosts: []
+    rate_limit_per_minute: 0
+  db_query:
+    allowed_tables: []
+    rate_limit_per_minute: 0

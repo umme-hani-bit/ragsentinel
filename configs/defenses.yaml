@@ -1,0 +1,7 @@
+rls:
+  enabled: true
+injection_scanner:
+  enabled: false
+  threshold: 0.65
+tool_guard:
+  enabled: false

@@ -1,0 +1,10 @@
+llm:
+  base_url: "http://provider.example"
+  model: "llama-3-8b"
+  api_key_env: "LLM_API_KEY"
+embeddings:
+  model: "bge-large-en-v1.5"
+reranker:
+  model: "bge-reranker-base"
+nli:
+  model: "microsoft/deberta-v3-base-mnli"

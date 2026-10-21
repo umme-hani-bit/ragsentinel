@@ -18,20 +18,26 @@ services:
     container_name: ragsentinel-api
     environment:
       DATABASE_URL: postgresql://ragsentinel:ragsentinel@db:5432/ragsentinel
+      CONFIG_DIR: /app/configs
     ports:
       - "8000:8000"
     depends_on:
       - db
+    volumes:
+      - ./configs:/app/configs:ro
 
   streamlit:
     build: ./services/streamlit
     container_name: ragsentinel-streamlit
     environment:
       API_BASE_URL: http://api:8000
+      CONFIG_DIR: /app/configs
     ports:
       - "8501:8501"
     depends_on:
       - api
+    volumes:
+      - ./configs:/app/configs:ro
 
 volumes:
   pgdata:
