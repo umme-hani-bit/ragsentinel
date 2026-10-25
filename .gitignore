@@ -4,7 +4,6 @@ __pycache__/
 .venv/
 venv/
 data/*
+!data/.gitkeep
 !data/metadata/
-data/metadata/*
-!data/metadata/doc_tenants.parquet
 .DS_Store
