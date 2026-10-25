@@ -3,5 +3,8 @@ __pycache__/
 .env
 .venv/
 venv/
-data/
+data/*
+!data/metadata/
+data/metadata/*
+!data/metadata/doc_tenants.parquet
 .DS_Store

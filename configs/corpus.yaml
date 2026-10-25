@@ -2,6 +2,6 @@ dataset: enron
 dataset_version: "enron_mail_20150507"
 tenants: 3
 seeds:
-  partition: 12345
+  partition: 403
   payloads: 23456
   qa: 34567
