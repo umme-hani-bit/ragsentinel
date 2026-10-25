@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import email
-import email.policy
 from email.utils import getaddresses, parsedate_to_datetime
 import hashlib
 import json
+import os
 import sys
 import tarfile
 from pathlib import Path
@@ -133,7 +133,7 @@ def _build_record(root_maildir: Path, file_path: Path) -> Optional[Dict[str, obj
     folder_path = "/".join(parts[1:-1])
     raw = file_path.read_bytes()
     try:
-        msg = email.message_from_bytes(raw, policy=email.policy.default)
+        msg = email.message_from_bytes(raw)
     except Exception:
         return None
 
@@ -167,6 +167,11 @@ def _build_record(root_maildir: Path, file_path: Path) -> Optional[Dict[str, obj
 
 
 def main() -> int:
+    limit_value = os.getenv("ENRON_LIMIT")
+    limit = int(limit_value) if limit_value is not None else None
+    if limit is not None and limit < 0:
+        raise ValueError("ENRON_LIMIT must be a non-negative integer")
+
     if not CORPUS_YAML.exists():
         print(
             f"ERROR: {CORPUS_YAML} not found. Run Phase 0 → Task 2 first.",
@@ -221,18 +226,24 @@ def main() -> int:
     out_path = OUT_DIR / "enron_emails.jsonl"
     count = 0
     skipped = 0
+    processed = 0
 
     print(f"Parsing emails under: {maildir_root}")
     with out_path.open("w", encoding="utf-8") as out_f:
         for file_path in _iter_email_files(maildir_root):
+            if limit is not None and processed >= limit:
+                break
+
             record = _build_record(maildir_root, file_path)
+            processed += 1
             if record is None:
                 skipped += 1
-                continue
-            out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            count += 1
-            if count % 5000 == 0:
-                print(f"  wrote {count:,} records...")
+            else:
+                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                count += 1
+
+            if processed % 1000 == 0:
+                print(f"Parsed {processed} emails...")
 
     print(f"Done. Wrote {count:,} records to {out_path} (skipped {skipped:,}).")
     print("enron_parse.py finished successfully.")
