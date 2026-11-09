@@ -15,6 +15,10 @@ AUG_INJ = Path("data/processed/enron_emails_aug_inj.parquet")  # preferred (has 
 CLEAN = Path("data/processed/enron_emails_clean.parquet")      # fallback
 TENANTS = Path("data/metadata/doc_tenants.parquet")            # used only with CLEAN fallback
 OUT = Path("data/metadata/qas_enron.parquet")
+DB_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://ragsvc:ragsvc@localhost:5432/ragsentinel",
+)
 OUT.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -194,9 +198,53 @@ def _iter_source() -> Tuple[Dict[str, str], pq.ParquetFile]:
     return doc_to_tenant, pq.ParquetFile(CLEAN)
 
 
+def _load_ingested_by_tenant(
+    db_url: str = DB_URL,
+    tenants: Tuple[str, ...] = ("A", "B", "C"),
+) -> Dict[str, Set[str]]:
+    """
+    Return {tenant_id: {doc_id, ...}} for documents actually ingested.
+
+    Uses the normal application role and respects RLS by setting
+    app.tenant_id once per tenant. No superuser / RLS bypass needed.
+    """
+    import psycopg2
+
+    conn = psycopg2.connect(db_url)
+    conn.autocommit = True
+    by_tenant: Dict[str, Set[str]] = {}
+
+    try:
+        with conn.cursor() as cur:
+            for tenant in tenants:
+                cur.execute("SELECT set_config('app.tenant_id', %s, false)", (tenant,))
+                cur.execute("SELECT doc_id FROM documents")
+                ids = {str(row[0]) for row in cur.fetchall()}
+                by_tenant[tenant] = ids
+                print(f"  ingested tenant {tenant}: {len(ids):,} documents")
+    finally:
+        conn.close()
+
+    return by_tenant
+
+
 def main() -> int:
     limit = int(os.getenv("QA_LIMIT", "300"))
     seed = int(os.getenv("QA_SEED", "34567"))
+
+    ingested_by_tenant = _load_ingested_by_tenant(DB_URL)
+
+    ingested_ids: Set[str] = set()
+    for ids in ingested_by_tenant.values():
+        ingested_ids.update(ids)
+
+    if not ingested_ids:
+        raise SystemExit(
+            "ERROR: No documents were visible. Check DATABASE_URL, confirm "
+            "ingestion finished, and confirm tenants A/B/C are readable."
+        )
+
+    print(f"Filtering source to {len(ingested_ids):,} ingested documents...")
 
     doc_to_tenant, pf = _iter_source()
     names = set(pf.schema.names)
@@ -208,22 +256,11 @@ def main() -> int:
 
     has_tenant_col = "tenant_id" in names
 
-    # Discover tenants
-    tenant_set: Set[str] = set()
-    for batch in pf.iter_batches(batch_size=5000):
-        if has_tenant_col:
-            tenant_set.update(set(batch.column(batch.schema.names.index("tenant_id")).to_pylist()))
-        else:
-            docs = batch.column(batch.schema.names.index("doc_id")).to_pylist()
-            for d in docs:
-                t = doc_to_tenant.get(d, "")
-                if t:
-                    tenant_set.add(t)
-        if len(tenant_set) >= 3:
-            break
+    tenants_sorted = sorted(t for t, ids in ingested_by_tenant.items() if ids)
+    if not tenants_sorted:
+        raise SystemExit("ERROR: No tenant has ingested documents.")
 
-    tenants_sorted = sorted(tenant_set) if tenant_set else ["A", "B", "C"]
-    per_tenant_target = max(1, limit // max(1, len(tenants_sorted)))
+    per_tenant_target = max(1, limit // len(tenants_sorted))
     target_per_tenant = {t: per_tenant_target for t in tenants_sorted}
 
     qas: List[Dict[str, object]] = []
@@ -246,6 +283,9 @@ def main() -> int:
         )
 
         for d, t, s, dt, raw, emp in zip(docs, tenants, subs, dts, raws, emps):
+            if str(d) not in ingested_ids:
+                continue
+
             if limit <= 0:
                 break
 
