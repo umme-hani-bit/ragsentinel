@@ -17,7 +17,7 @@ services:
     build: ./services/api
     container_name: ragsentinel-api
     environment:
-      DATABASE_URL: postgresql://ragsentinel:ragsentinel@db:5432/ragsentinel
+      DATABASE_URL: postgresql://ragsvc:ragsvc@db:5432/ragsentinel
       CONFIG_DIR: /app/configs
     ports:
       - "8000:8000"
