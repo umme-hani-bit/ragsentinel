@@ -19,12 +19,21 @@ services:
     environment:
       DATABASE_URL: postgresql://ragsvc:ragsvc@db:5432/ragsentinel
       CONFIG_DIR: /app/configs
+      PYTHONPATH: /app
+      HF_HOME: /models/hf
+      FASTEMBED_CACHE_PATH: /models/fastembed
+      SENTENCE_TRANSFORMERS_HOME: /models/st
+      RETRIEVAL_FTS_K: "10"
+      RETRIEVAL_DENSE_K: "10"
+      RERANK_MODEL: "Xenova/ms-marco-MiniLM-L-6-v2"
     ports:
       - "8000:8000"
     depends_on:
       - db
     volumes:
       - ./configs:/app/configs:ro
+      - ./services/retrieval:/app/retrieval:ro
+      - ./.model_cache:/models
 
   streamlit:
     build: ./services/streamlit

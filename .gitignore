@@ -7,3 +7,5 @@ data/*
 !data/.gitkeep
 !data/metadata/
 .DS_Store
+.model_cache/
+services/api/app/main.py.bak

@@ -1,25 +1,118 @@
 #!/usr/bin/env python3
-"""Hybrid retrieval engine: FTS + dense vector search + reranking."""
+"""
+Hybrid Retrieval Engine: FTS + Dense (pgvector) + Reranking.
 
+Security model:
+- RLS is FORCED on all tables; the app role is non-superuser.
+- Tenant context is set per connection, and connections are request-scoped.
+- SQL also filters on tenant_id explicitly (defence in depth).
+"""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Dict, List, Optional
 
 import psycopg2
 from fastembed import TextEmbedding
-from sentence_transformers import CrossEncoder
 
+
+# ---------------- configuration ----------------
 DB_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://ragsentinel:ragsentinel@localhost:5432/ragsentinel",
 )
 
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-large-en-v1.5")
 
+# bge-reranker-base is the target model; the smaller ones are fallbacks
+# because this runs on CPU.
+RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base")
+RERANK_FALLBACK_MODELS = (
+    "Xenova/ms-marco-MiniLM-L-12-v2",
+    "Xenova/ms-marco-MiniLM-L-6-v2",
+)
+
+
+# ---------------- module-level model cache ----------------
+_MODEL_LOCK = threading.Lock()
+_EMBED_MODEL: Optional[TextEmbedding] = None
+_RERANKER = None
+_RERANKER_LOAD_ATTEMPTED = False
+_RERANKER_ERROR = ""
+
+
+def get_embed_model() -> TextEmbedding:
+    global _EMBED_MODEL
+    if _EMBED_MODEL is None:
+        with _MODEL_LOCK:
+            if _EMBED_MODEL is None:
+                print(f"Loading embedding model ({EMBED_MODEL_NAME})...")
+                _EMBED_MODEL = TextEmbedding(model_name=EMBED_MODEL_NAME)
+                print("Embedding model ready.")
+    return _EMBED_MODEL
+
+
+def _load_cross_encoder():
+    """Load a fastembed ONNX cross-encoder, trying several model names."""
+    try:
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
+    except ImportError:
+        from fastembed import TextCrossEncoder
+
+    candidates = (RERANK_MODEL,) + RERANK_FALLBACK_MODELS
+    last_error: Optional[Exception] = None
+
+    for name in candidates:
+        try:
+            print(f"Loading reranker ({name})...")
+            model = TextCrossEncoder(model_name=name)
+            print(f"Reranker ready ({name}).")
+            return model, name
+        except Exception as exc:
+            print(f"  reranker '{name}' unavailable: {type(exc).__name__}: {exc}")
+            last_error = exc
+
+    raise RuntimeError(f"No reranker model could be loaded: {last_error}")
+
+
+def get_reranker():
+    """Returns the cross-encoder, or None if unavailable."""
+    global _RERANKER, _RERANKER_LOAD_ATTEMPTED, _RERANKER_ERROR
+
+    if _RERANKER is not None:
+        return _RERANKER
+
+    with _MODEL_LOCK:
+        if _RERANKER is not None:
+            return _RERANKER
+        if _RERANKER_LOAD_ATTEMPTED:
+            return None
+
+        _RERANKER_LOAD_ATTEMPTED = True
+        try:
+            _RERANKER, _ = _load_cross_encoder()
+        except Exception as exc:
+            _RERANKER_ERROR = f"{type(exc).__name__}: {exc}"
+            print(f"[warn] reranker disabled, using heuristic score: {_RERANKER_ERROR}")
+            _RERANKER = None
+
+    return _RERANKER
+
+
+def reranker_status() -> Dict[str, object]:
+    return {
+        "loaded": _RERANKER is not None,
+        "attempted": _RERANKER_LOAD_ATTEMPTED,
+        "error": _RERANKER_ERROR,
+    }
+
+
+# ---------------- result types ----------------
 @dataclass
 class ChunkResult:
     chunk_id: int
@@ -38,35 +131,30 @@ class RetrievalResult:
     query: str
     tenant_id: str
     top_n: int
-    chunks: list[ChunkResult]
-    timings: dict[str, float] = field(default_factory=dict)
+    chunks: List[ChunkResult]
+    timings: Dict[str, float] = field(default_factory=dict)
     fts_count: int = 0
     dense_count: int = 0
     merged_count: int = 0
+    reranked: bool = False
 
 
 class HybridRetriever:
     def __init__(self, db_url: str = DB_URL):
         self.db_url = db_url
-        self._conn: psycopg2.extensions.connection | None = None
-        self._current_tenant: str | None = None
-        self._embed_model: TextEmbedding | None = None
-        self._reranker: CrossEncoder | None = None
+        self._conn: Optional[psycopg2.extensions.connection] = None
+        self._current_tenant: Optional[str] = None
 
+    # ---- models (module-cached, no torch) ----
     @property
     def embed_model(self) -> TextEmbedding:
-        if self._embed_model is None:
-            print("Loading embedding model (BAAI/bge-large-en-v1.5)...")
-            self._embed_model = TextEmbedding(model_name="BAAI/bge-large-en-v1.5")
-        return self._embed_model
+        return get_embed_model()
 
     @property
-    def reranker(self) -> CrossEncoder:
-        if self._reranker is None:
-            print("Loading reranker (BAAI/bge-reranker-base)...")
-            self._reranker = CrossEncoder("BAAI/bge-reranker-base")
-        return self._reranker
+    def reranker(self):
+        return get_reranker()
 
+    # ---- connection management ----
     def _ensure_conn(self, tenant_id: str) -> psycopg2.extensions.connection:
         if self._conn is None or self._conn.closed:
             self._conn = psycopg2.connect(self.db_url)
@@ -75,18 +163,27 @@ class HybridRetriever:
 
         if self._current_tenant != tenant_id:
             with self._conn.cursor() as cur:
-                cur.execute("SET app.tenant_id = %s", (tenant_id,))
+                cur.execute(
+                    "SELECT set_config('app.tenant_id', %s, false)",
+                    (tenant_id,),
+                )
             self._current_tenant = tenant_id
 
         return self._conn
 
     def close(self) -> None:
-        if self._conn is not None and not self._conn.closed:
+        if self._conn and not self._conn.closed:
             self._conn.close()
         self._conn = None
         self._current_tenant = None
 
-    def fts_search(self, query: str, tenant_id: str, top_k: int = 50) -> list[ChunkResult]:
+    # ---- FTS ----
+    def fts_search(
+        self,
+        query: str,
+        tenant_id: str,
+        top_k: int = 20,
+    ) -> List[ChunkResult]:
         conn = self._ensure_conn(tenant_id)
 
         with conn.cursor() as cur:
@@ -95,11 +192,12 @@ class HybridRetriever:
                 SELECT c.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
                        ts_rank(c.tsv, plainto_tsquery('english', %s)) AS rank
                 FROM chunks c
-                WHERE c.tsv @@ plainto_tsquery('english', %s)
+                WHERE c.tenant_id = %s
+                  AND c.tsv @@ plainto_tsquery('english', %s)
                 ORDER BY rank DESC
                 LIMIT %s
                 """,
-                (query, query, top_k),
+                (query, tenant_id, query, top_k),
             )
             rows = cur.fetchall()
 
@@ -116,9 +214,15 @@ class HybridRetriever:
             for row in rows
         ]
 
-    def dense_search(self, query: str, tenant_id: str, top_k: int = 50) -> list[ChunkResult]:
+    # ---- Dense ----
+    def dense_search(
+        self,
+        query: str,
+        tenant_id: str,
+        top_k: int = 20,
+    ) -> List[ChunkResult]:
         query_vec = list(self.embed_model.embed([query]))[0].tolist()
-        vec_str = "[" + ",".join(str(x) for x in query_vec) + "]"
+        vec_str = "[" + ",".join(f"{value:.8f}" for value in query_vec) + "]"
 
         conn = self._ensure_conn(tenant_id)
 
@@ -129,10 +233,12 @@ class HybridRetriever:
                        1 - (e.vec <=> %s::vector) AS similarity
                 FROM embeddings e
                 JOIN chunks c ON c.chunk_id = e.chunk_id
+                WHERE c.tenant_id = %s
+                  AND e.tenant_id = %s
                 ORDER BY e.vec <=> %s::vector
                 LIMIT %s
                 """,
-                (vec_str, vec_str, top_k),
+                (vec_str, tenant_id, tenant_id, vec_str, top_k),
             )
             rows = cur.fetchall()
 
@@ -149,66 +255,110 @@ class HybridRetriever:
             for row in rows
         ]
 
+    # ---- Merge ----
     def _merge_results(
         self,
-        fts_results: list[ChunkResult],
-        dense_results: list[ChunkResult],
-    ) -> list[ChunkResult]:
-        seen: dict[int, ChunkResult] = {}
+        fts_results: List[ChunkResult],
+        dense_results: List[ChunkResult],
+    ) -> List[ChunkResult]:
+        merged: Dict[int, ChunkResult] = {}
 
         for candidate in fts_results:
-            seen[candidate.chunk_id] = candidate
+            merged[candidate.chunk_id] = candidate
 
         for candidate in dense_results:
-            if candidate.chunk_id in seen:
-                seen[candidate.chunk_id].dense_score = candidate.dense_score
-                seen[candidate.chunk_id].source = "both"
+            if candidate.chunk_id in merged:
+                merged[candidate.chunk_id].dense_score = candidate.dense_score
+                merged[candidate.chunk_id].source = "both"
             else:
-                seen[candidate.chunk_id] = candidate
+                merged[candidate.chunk_id] = candidate
 
-        return list(seen.values())
+        return list(merged.values())
 
-    def _rerank(self, query: str, candidates: list[ChunkResult], top_n: int) -> list[ChunkResult]:
+    # ---- Rerank with graceful fallback ----
+    @staticmethod
+    def _heuristic_score(candidate: ChunkResult) -> float:
+        """Used when the cross-encoder is unavailable."""
+        if candidate.source == "both":
+            return 1.0 + (0.5 * candidate.dense_score) + candidate.fts_score
+        if candidate.source == "dense":
+            return candidate.dense_score
+        return candidate.fts_score
+
+    def _rerank(
+        self,
+        query: str,
+        candidates: List[ChunkResult],
+        top_n: int,
+    ) -> tuple:
+        """Returns (ranked_candidates, used_cross_encoder)."""
         if not candidates:
-            return []
+            return [], False
 
-        pairs = [(query, candidate.text) for candidate in candidates]
-        scores = self.reranker.predict(pairs)
+        model = self.reranker
 
-        for i, candidate in enumerate(candidates):
-            candidate.rerank_score = float(scores[i])
+        if model is None:
+            for candidate in candidates:
+                candidate.rerank_score = self._heuristic_score(candidate)
+            candidates.sort(key=lambda candidate: candidate.rerank_score, reverse=True)
+            return candidates[:top_n], False
 
-        candidates.sort(key=lambda item: item.rerank_score, reverse=True)
-        return candidates[:top_n]
+        texts = [candidate.text for candidate in candidates]
+        try:
+            results = list(model.rerank(query, texts))
+            scores = [0.0] * len(candidates)
+            for result in results:
+                index = int(getattr(result, "index"))
+                if 0 <= index < len(candidates):
+                    scores[index] = float(getattr(result, "score"))
+        except Exception as exc:
+            print(
+                f"[warn] rerank failed, using heuristic: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            for candidate in candidates:
+                candidate.rerank_score = self._heuristic_score(candidate)
+            candidates.sort(key=lambda candidate: candidate.rerank_score, reverse=True)
+            return candidates[:top_n], False
 
+        for index, candidate in enumerate(candidates):
+            candidate.rerank_score = scores[index]
+
+        candidates.sort(key=lambda candidate: candidate.rerank_score, reverse=True)
+        return candidates[:top_n], True
+
+    # ---- Hybrid ----
     def hybrid_search(
         self,
         query: str,
         tenant_id: str,
-        top_k_fts: int = 50,
-        top_k_dense: int = 50,
-        top_n: int = 20,
+        top_k_fts: int = 20,
+        top_k_dense: int = 20,
+        top_n: int = 5,
     ) -> RetrievalResult:
-        timings: dict[str, float] = {}
+        timings: Dict[str, float] = {}
 
-        t0 = time.perf_counter()
+        start = time.perf_counter()
         fts_results = self.fts_search(query, tenant_id, top_k_fts)
-        timings["fts_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        timings["fts_ms"] = round((time.perf_counter() - start) * 1000, 1)
 
-        t0 = time.perf_counter()
+        start = time.perf_counter()
         dense_results = self.dense_search(query, tenant_id, top_k_dense)
-        timings["dense_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        timings["dense_ms"] = round((time.perf_counter() - start) * 1000, 1)
 
-        t0 = time.perf_counter()
+        start = time.perf_counter()
         merged = self._merge_results(fts_results, dense_results)
-        timings["merge_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        timings["merge_ms"] = round((time.perf_counter() - start) * 1000, 1)
 
-        t0 = time.perf_counter()
-        final = self._rerank(query, merged, top_n)
-        timings["rerank_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        start = time.perf_counter()
+        final, used_reranker = self._rerank(query, merged, top_n)
+        timings["rerank_ms"] = round((time.perf_counter() - start) * 1000, 1)
 
         timings["total_ms"] = round(
-            timings["fts_ms"] + timings["dense_ms"] + timings["merge_ms"] + timings["rerank_ms"],
+            timings["fts_ms"]
+            + timings["dense_ms"]
+            + timings["merge_ms"]
+            + timings["rerank_ms"],
             1,
         )
 
@@ -221,9 +371,15 @@ class HybridRetriever:
             fts_count=len(fts_results),
             dense_count=len(dense_results),
             merged_count=len(merged),
+            reranked=used_reranker,
         )
 
-    def log_retrieval(self, result: RetrievalResult, defense_profile: str = "none") -> None:
+    # ---- Logging ----
+    def log_retrieval(
+        self,
+        result: RetrievalResult,
+        defense_profile: str = "none",
+    ) -> None:
         conn = self._ensure_conn(result.tenant_id)
         qhash = hashlib.sha256(result.query.encode("utf-8")).hexdigest()[:16]
 
@@ -245,51 +401,43 @@ class HybridRetriever:
             )
 
 
+# ---------------- standalone test ----------------
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Test hybrid retrieval")
-    parser.add_argument("--query", type=str, required=True, help="Search query")
-    parser.add_argument("--tenant", type=str, default="A", help="Tenant ID (A/B/C)")
-    parser.add_argument("--top-n", type=int, default=10, help="Final results to return")
-    parser.add_argument("--fts-k", type=int, default=50, help="FTS candidates")
-    parser.add_argument("--dense-k", type=int, default=50, help="Dense candidates")
+    parser.add_argument("--query", required=True)
+    parser.add_argument("--tenant", default="A")
+    parser.add_argument("--top-n", type=int, default=5)
+    parser.add_argument("--fts-k", type=int, default=20)
+    parser.add_argument("--dense-k", type=int, default=20)
     args = parser.parse_args()
 
     retriever = HybridRetriever()
-
-    print(f"\nQuery: {args.query}")
-    print(f"Tenant: {args.tenant}")
-    print(f"Parameters: FTS top-{args.fts_k}, Dense top-{args.dense_k}, Final top-{args.top_n}")
-    print("-" * 80)
-
-    result = retriever.hybrid_search(
-        query=args.query,
-        tenant_id=args.tenant,
-        top_k_fts=args.fts_k,
-        top_k_dense=args.dense_k,
-        top_n=args.top_n,
-    )
-
-    print(f"\nFTS candidates: {result.fts_count}")
-    print(f"Dense candidates: {result.dense_count}")
-    print(f"After merge: {result.merged_count}")
-    print(f"After rerank: {len(result.chunks)}")
-    print(f"\nTimings: {result.timings}")
-
-    print(f"\nTop {len(result.chunks)} results:")
-    print("-" * 80)
-    for i, chunk in enumerate(result.chunks, 1):
-        preview = chunk.text[:120].replace("\n", " ")
-        print(
-            f"  {i:2d}. [{chunk.source:5s}] doc={chunk.doc_id[:30]:30s} "
-            f"rerank={chunk.rerank_score:+.4f}  {preview}..."
+    try:
+        result = retriever.hybrid_search(
+            args.query,
+            args.tenant,
+            top_k_fts=args.fts_k,
+            top_k_dense=args.dense_k,
+            top_n=args.top_n,
         )
-
-    retriever.log_retrieval(result)
-    print("\nLogged to retrieval_logs table.")
-
-    retriever.close()
+        print(
+            f"FTS={result.fts_count} Dense={result.dense_count} "
+            f"Merged={result.merged_count} Final={len(result.chunks)} "
+            f"Reranked={result.reranked}"
+        )
+        print(f"Timings: {result.timings}")
+        print(f"Reranker status: {reranker_status()}")
+        for index, chunk in enumerate(result.chunks, 1):
+            preview = chunk.text[:110].replace("\n", " ")
+            print(
+                f"{index:2d}. [{chunk.source:5s}] {chunk.doc_id} | "
+                f"{chunk.rerank_score:+.4f} | {preview}"
+            )
+        retriever.log_retrieval(result, defense_profile="standalone_test")
+    finally:
+        retriever.close()
 
 
 if __name__ == "__main__":
