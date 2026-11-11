@@ -187,9 +187,32 @@ def _generate(
         return _stub_output(req, contexts), "stub"
 
     settings = load_llm_settings()
-    raw = generate_llm_response(prompt, settings, system_prompt=JSON_SYSTEM)
-    parsed = parse_llm_json_response(raw)
-    return parsed, f"hosted:{settings.model}"
+    max_retries = max(0, settings.max_retries)
+    attempts = max_retries + 1
+    for attempt in range(attempts):
+        system_prompt = JSON_SYSTEM
+        if attempt:
+            system_prompt += (
+                "\nYour previous response did not satisfy the required JSON "
+                "schema. Return only a valid JSON object matching it exactly."
+            )
+        raw = generate_llm_response(prompt, settings, system_prompt=system_prompt)
+        try:
+            parsed = parse_llm_json_response(raw)
+        except json.JSONDecodeError as exc:
+            if attempt + 1 == attempts:
+                raise LLMError(
+                    f"malformed JSON from model after {max_retries} retries"
+                ) from exc
+        except ValueError as exc:
+            if attempt + 1 == attempts:
+                raise LLMError(
+                    f"invalid structured JSON from model after {max_retries} retries"
+                ) from exc
+        else:
+            return parsed, f"hosted:{settings.model}"
+
+    raise LLMError(f"malformed JSON from model after {max_retries} retries")
 
 
 # ---------------- routes ----------------

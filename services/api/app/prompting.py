@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Dict, List
 
 
@@ -84,48 +83,30 @@ def detect_context_taint(chunks: List[Dict[str, Any]]) -> List[str]:
     return sorted(flags)
 
 
-def _coerce_citations(value: Any) -> List[int]:
-    if not isinstance(value, list):
-        return []
-    out: List[int] = []
-    for item in value:
-        try:
-            out.append(int(item))
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
 def parse_llm_json_response(raw_text: str) -> Dict[str, Any]:
     cleaned = (raw_text or "").strip()
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM JSON root is not an object.")
 
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
-    if fenced:
-        cleaned = fenced.group(1)
-    else:
-        start, end = cleaned.find("{"), cleaned.rfind("}")
-        if start != -1 and end > start:
-            cleaned = cleaned[start : end + 1]
-
-    try:
-        parsed = json.loads(cleaned)
-        if not isinstance(parsed, dict):
-            raise ValueError("JSON root is not an object")
-    except (json.JSONDecodeError, ValueError):
-        return {
-            "answer": raw_text or "",
-            "citations": [],
-            "tool_calls": [],
-            "safety_notes": "unparseable_llm_output",
-        }
-
-    tool_calls = parsed.get("tool_calls")
-    if not isinstance(tool_calls, list):
-        tool_calls = []
+    required_keys = {"answer", "citations", "tool_calls", "safety_notes"}
+    if set(parsed) != required_keys:
+        raise ValueError("LLM JSON does not match the required response fields.")
+    if not isinstance(parsed["answer"], str):
+        raise ValueError("LLM JSON answer must be a string.")
+    if not isinstance(parsed["citations"], list) or any(
+        not isinstance(item, int) or isinstance(item, bool)
+        for item in parsed["citations"]
+    ):
+        raise ValueError("LLM JSON citations must be a list of integers.")
+    if parsed["tool_calls"] != []:
+        raise ValueError("LLM JSON tool_calls must be an empty list.")
+    if not isinstance(parsed["safety_notes"], str):
+        raise ValueError("LLM JSON safety_notes must be a string.")
 
     return {
-        "answer": str(parsed.get("answer", "")),
-        "citations": _coerce_citations(parsed.get("citations", [])),
-        "tool_calls": tool_calls,
-        "safety_notes": str(parsed.get("safety_notes", "")),
+        "answer": parsed["answer"],
+        "citations": parsed["citations"],
+        "tool_calls": parsed["tool_calls"],
+        "safety_notes": parsed["safety_notes"],
     }

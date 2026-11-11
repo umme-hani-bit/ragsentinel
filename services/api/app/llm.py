@@ -120,7 +120,8 @@ def load_llm_settings() -> LLMSettings:
 
 
 def api_key_for(settings: LLMSettings) -> str:
-    return os.getenv(settings.api_key_env, "") or os.getenv("LLM_API_KEY", "")
+    raw = os.getenv(settings.api_key_env, "") or os.getenv("LLM_API_KEY", "")
+    return raw.strip().strip('"').strip("'").strip()
 
 
 def chat_endpoint(base_url: str) -> str:

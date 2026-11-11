@@ -1,6 +1,6 @@
 llm:
   base_url: "https://api.groq.com/openai/v1"
-  model: "llama-3.1-8b-instant"
+  model: "openai/gpt-oss-20b"
   api_key_env: "LLM_API_KEY"
   timeout_s: 60
   timeout_seconds: 60
