@@ -16,6 +16,8 @@ services:
   api:
     build: ./services/api
     container_name: ragsentinel-api
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://ragsvc:ragsvc@db:5432/ragsentinel
       CONFIG_DIR: /app/configs
@@ -25,6 +27,7 @@ services:
       SENTENCE_TRANSFORMERS_HOME: /models/st
       RETRIEVAL_FTS_K: "10"
       RETRIEVAL_DENSE_K: "10"
+      LLM_MODE: "${LLM_MODE:-hosted}"
       RERANK_MODEL: "Xenova/ms-marco-MiniLM-L-6-v2"
     ports:
       - "8000:8000"
