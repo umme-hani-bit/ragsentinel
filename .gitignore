@@ -10,4 +10,5 @@ data/*
 !data/metadata/
 .DS_Store
 .model_cache/
+models/injection_classifier/saved_model/
 services/api/app/main.py.bak
