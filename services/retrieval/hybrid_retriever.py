@@ -4,7 +4,7 @@ Hybrid Retrieval Engine: FTS + Dense (pgvector) + Reranking.
 
 Security model:
 - RLS is FORCED on all tables; the app role is non-superuser.
-- Tenant context is set per connection, and connections are request-scoped.
+- Tenant context is transaction-local for every database operation.
 - SQL also filters on tenant_id explicitly (defence in depth).
 """
 from __future__ import annotations
@@ -14,8 +14,9 @@ import json
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import psycopg2
 from fastembed import TextEmbedding
@@ -143,7 +144,6 @@ class HybridRetriever:
     def __init__(self, db_url: str = DB_URL):
         self.db_url = db_url
         self._conn: Optional[psycopg2.extensions.connection] = None
-        self._current_tenant: Optional[str] = None
 
     # ---- models (module-cached, no torch) ----
     @property
@@ -155,27 +155,30 @@ class HybridRetriever:
         return get_reranker()
 
     # ---- connection management ----
-    def _ensure_conn(self, tenant_id: str) -> psycopg2.extensions.connection:
+    def _ensure_conn(self) -> psycopg2.extensions.connection:
         if self._conn is None or self._conn.closed:
             self._conn = psycopg2.connect(self.db_url)
-            self._conn.autocommit = True
-            self._current_tenant = None
-
-        if self._current_tenant != tenant_id:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "SELECT set_config('app.tenant_id', %s, false)",
-                    (tenant_id,),
-                )
-            self._current_tenant = tenant_id
-
         return self._conn
+
+    @contextmanager
+    def _tenant_transaction(
+        self,
+        tenant_id: str,
+    ) -> Iterator[psycopg2.extensions.connection]:
+        conn = self._ensure_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL app.tenant_id = %s", (tenant_id,))
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def close(self) -> None:
         if self._conn and not self._conn.closed:
             self._conn.close()
         self._conn = None
-        self._current_tenant = None
 
     # ---- FTS ----
     def fts_search(
@@ -184,22 +187,21 @@ class HybridRetriever:
         tenant_id: str,
         top_k: int = 20,
     ) -> List[ChunkResult]:
-        conn = self._ensure_conn(tenant_id)
-
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT c.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
-                       ts_rank(c.tsv, plainto_tsquery('english', %s)) AS rank
-                FROM chunks c
-                WHERE c.tenant_id = %s
-                  AND c.tsv @@ plainto_tsquery('english', %s)
-                ORDER BY rank DESC
-                LIMIT %s
-                """,
-                (query, tenant_id, query, top_k),
-            )
-            rows = cur.fetchall()
+        with self._tenant_transaction(tenant_id) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT c.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
+                           ts_rank(c.tsv, plainto_tsquery('english', %s)) AS rank
+                    FROM chunks c
+                    WHERE c.tenant_id = %s
+                      AND c.tsv @@ plainto_tsquery('english', %s)
+                    ORDER BY rank DESC
+                    LIMIT %s
+                    """,
+                    (query, tenant_id, query, top_k),
+                )
+                rows = cur.fetchall()
 
         return [
             ChunkResult(
@@ -224,23 +226,22 @@ class HybridRetriever:
         query_vec = list(self.embed_model.embed([query]))[0].tolist()
         vec_str = "[" + ",".join(f"{value:.8f}" for value in query_vec) + "]"
 
-        conn = self._ensure_conn(tenant_id)
-
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT e.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
-                       1 - (e.vec <=> %s::vector) AS similarity
-                FROM embeddings e
-                JOIN chunks c ON c.chunk_id = e.chunk_id
-                WHERE c.tenant_id = %s
-                  AND e.tenant_id = %s
-                ORDER BY e.vec <=> %s::vector
-                LIMIT %s
-                """,
-                (vec_str, tenant_id, tenant_id, vec_str, top_k),
-            )
-            rows = cur.fetchall()
+        with self._tenant_transaction(tenant_id) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT e.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
+                           1 - (e.vec <=> %s::vector) AS similarity
+                    FROM embeddings e
+                    JOIN chunks c ON c.chunk_id = e.chunk_id
+                    WHERE c.tenant_id = %s
+                      AND e.tenant_id = %s
+                    ORDER BY e.vec <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (vec_str, tenant_id, tenant_id, vec_str, top_k),
+                )
+                rows = cur.fetchall()
 
         return [
             ChunkResult(
@@ -380,25 +381,25 @@ class HybridRetriever:
         result: RetrievalResult,
         defense_profile: str = "none",
     ) -> None:
-        conn = self._ensure_conn(result.tenant_id)
         qhash = hashlib.sha256(result.query.encode("utf-8")).hexdigest()[:16]
 
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO retrieval_logs
-                    (tenant_id, qhash, query, top_k, timings_ms, defense_profile)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    result.tenant_id,
-                    qhash,
-                    result.query,
-                    result.top_n,
-                    json.dumps(result.timings),
-                    defense_profile,
-                ),
-            )
+        with self._tenant_transaction(result.tenant_id) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO retrieval_logs
+                        (tenant_id, qhash, query, top_k, timings_ms, defense_profile)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        result.tenant_id,
+                        qhash,
+                        result.query,
+                        result.top_n,
+                        json.dumps(result.timings),
+                        defense_profile,
+                    ),
+                )
 
 
 # ---------------- standalone test ----------------
