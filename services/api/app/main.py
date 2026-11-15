@@ -378,6 +378,7 @@ def query_rag(req: QueryRequest) -> QueryResponse:
     leakage = detect_leakage(
         answer=parsed.get("answer", ""),
         requesting_tenant=req.tenant_id,
+        presidio_enabled=False,
     )
     timings["leakage_check_ms"] = round(
         (time.perf_counter() - leakage_start) * 1000,
