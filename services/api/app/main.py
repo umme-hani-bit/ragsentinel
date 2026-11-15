@@ -15,6 +15,7 @@ from app.llm import (
     llm_settings_summary,
     load_llm_settings,
 )
+from app.leakage import detect_leakage
 from app.nli import verify_faithfulness
 from app.prompting import (
     build_rag_prompt,
@@ -372,6 +373,17 @@ def query_rag(req: QueryRequest) -> QueryResponse:
             2,
         )
 
+    # 5. Leakage detection is an always-on scoring metric; it only reads the answer.
+    leakage_start = time.perf_counter()
+    leakage = detect_leakage(
+        answer=parsed.get("answer", ""),
+        requesting_tenant=req.tenant_id,
+    )
+    timings["leakage_check_ms"] = round(
+        (time.perf_counter() - leakage_start) * 1000,
+        2,
+    )
+
     tool_calls: List[ToolCall] = []
     safety_notes = parsed.get("safety_notes", "")
     requested_tool_calls = parsed.get("tool_calls", [])
@@ -440,4 +452,5 @@ def query_rag(req: QueryRequest) -> QueryResponse:
         config_fingerprint=_fingerprint(),
         llm_mode=response_mode,
         faithfulness=faithfulness,
+        leakage=leakage,
     )

@@ -58,3 +58,4 @@ class QueryResponse(BaseModel):
     config_fingerprint: str = ""
     llm_mode: str = "stub"
     faithfulness: Optional[Dict[str, Any]] = None
+    leakage: Optional[Dict[str, Any]] = None

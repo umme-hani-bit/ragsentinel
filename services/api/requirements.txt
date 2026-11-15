@@ -7,3 +7,5 @@ requests==2.32.3
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.4.1+cpu
 transformers==4.44.2
+presidio-analyzer==2.2.357
+spacy==3.7.5
