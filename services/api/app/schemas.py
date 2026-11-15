@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -16,6 +16,10 @@ class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=4000)
     defense_profile: DefenseProfile = Field(default_factory=DefenseProfile)
     top_k: int = Field(default=5, ge=1, le=20)
+    run_nli_verifier: bool = Field(
+        default=True,
+        description="Run NLI faithfulness check (metric, not a defense)",
+    )
 
 
 class Citation(BaseModel):
@@ -29,7 +33,9 @@ class Citation(BaseModel):
 class ToolCall(BaseModel):
     tool_name: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
-    status: str = "allowed"
+    status: Literal["allowed", "blocked"] = "blocked"
+    reason: str = ""
+    execution_time_ms: float = 0.0
 
 
 class LLMStructuredOutput(BaseModel):
@@ -51,3 +57,4 @@ class QueryResponse(BaseModel):
     timings_ms: Dict[str, float] = Field(default_factory=dict)
     config_fingerprint: str = ""
     llm_mode: str = "stub"
+    faithfulness: Optional[Dict[str, Any]] = None
