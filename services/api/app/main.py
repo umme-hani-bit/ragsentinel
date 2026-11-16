@@ -4,6 +4,7 @@ import json
 import os
 import time
 from typing import Any, Dict, List, Tuple
+from urllib import request
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +33,8 @@ except ImportError:  # repo root / host execution
 
 import psycopg2  # noqa: F401
 
+BENCHMARK_MODE = os.getenv("RAGSENTINEL_BENCHMARK_MODE", "0") == "1"
+EVAL_DB_URL = "postgresql://rageval:rageval@db:5432/ragsentinel"
 
 app = FastAPI(title="RAGsentinel API")
 
@@ -42,7 +45,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.on_event("startup")
+def _preload_models() -> None:
+    """Load embedding + reranker models BEFORE accepting traffic.
 
+    Without this, the first /query after a container restart blocks for
+    minutes inside the request thread while bge-large loads, and the client
+    connection dies (RemoteDisconnected). With it, 'startup complete' means
+    'models are ready' — deterministic behavior.
+    """
+    try:
+        from retrieval.hybrid_retriever import get_embed_model, get_reranker
+    except ImportError:
+        from services.retrieval.hybrid_retriever import get_embed_model, get_reranker
+    get_embed_model()
+    get_reranker()
 CONFIG_DIR = os.getenv("CONFIG_DIR", "/app/configs")
 
 try:
@@ -78,11 +95,9 @@ def search_hybrid_and_rerank(
     top_k: int = 5,
     rls_enabled: bool = True,
     defense_profile: str = "rls_only",
+    db_url: str = DB_URL ,
 ) -> Dict[str, Any]:
-    if not rls_enabled:
-        raise ValueError("RLS cannot be disabled through the query API.")
-
-    retriever = HybridRetriever(db_url=DB_URL)
+    retriever = HybridRetriever(db_url=db_url, rls_enabled=rls_enabled)
     try:
         result = retriever.hybrid_search(
             query=query,
@@ -94,7 +109,7 @@ def search_hybrid_and_rerank(
 
         rows: List[Dict[str, Any]] = []
         for chunk in result.chunks:
-            if chunk.tenant_id != tenant_id:
+            if rls_enabled and chunk.tenant_id != tenant_id:
                 raise RuntimeError("cross_tenant_chunk_in_retrieval_result")
             rows.append(
                 {
@@ -275,10 +290,14 @@ def query_rag(req: QueryRequest) -> QueryResponse:
         )
 
     if not req.defense_profile.rls_enabled:
-        raise HTTPException(
-            status_code=400,
-            detail="rls_enabled is enforced server-side and cannot be disabled.",
-        )
+        if not BENCHMARK_MODE:
+            raise HTTPException(
+                status_code=400,
+                detail="rls_enabled=false requires RAGSENTINEL_BENCHMARK_MODE=1 on the server.",
+            )
+        db_url, rls_on = EVAL_DB_URL, False
+    else:
+        db_url, rls_on = DB_URL, True
 
     # 1. Retrieval
     retrieval_start = time.perf_counter()
@@ -287,7 +306,8 @@ def query_rag(req: QueryRequest) -> QueryResponse:
             query=req.query,
             tenant_id=req.tenant_id,
             top_k=req.top_k,
-            rls_enabled=True,
+            rls_enabled=rls_on,
+            db_url=db_url,
             defense_profile="rls_only",
         )
     except Exception as exc:
@@ -307,12 +327,13 @@ def query_rag(req: QueryRequest) -> QueryResponse:
         except (TypeError, ValueError):
             continue
 
-    for chunk in raw_chunks:
-        if chunk.get("tenant_id") != req.tenant_id:
-            raise HTTPException(
-                status_code=503,
-                detail="cross_tenant_chunk_in_retrieval_result",
-            )
+    if rls_on:
+        for chunk in raw_chunks:
+            if chunk.get("tenant_id") != req.tenant_id:
+                raise HTTPException(
+                    status_code=503,
+                    detail="cross_tenant_chunk_in_retrieval_result",
+                )
 
     contexts = [
         Citation(

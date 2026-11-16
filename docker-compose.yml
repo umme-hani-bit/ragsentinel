@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -19,6 +17,7 @@ services:
     env_file:
       - .env
     environment:
+      RAGSENTINEL_BENCHMARK_MODE: "1"
       DATABASE_URL: postgresql://ragsvc:ragsvc@db:5432/ragsentinel
       CONFIG_DIR: /app/configs
       PYTHONPATH: /app
@@ -36,6 +35,7 @@ services:
     volumes:
       - ./configs:/app/configs:ro
       - ./services/retrieval:/app/retrieval:ro
+      - ./services/api/app:/app/app:ro
       - ./.model_cache:/models
 
   streamlit:

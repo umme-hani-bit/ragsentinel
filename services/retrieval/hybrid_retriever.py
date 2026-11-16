@@ -6,6 +6,9 @@ Security model:
 - RLS is FORCED on all tables; the app role is non-superuser.
 - Tenant context is transaction-local for every database operation.
 - SQL also filters on tenant_id explicitly (defence in depth).
+- Benchmark ablations: when constructed with rls_enabled=False (only
+  reachable via RAGSENTINEL_BENCHMARK_MODE=1 on the API), tenant scoping
+  is skipped and the caller supplies a least-privilege BYPASSRLS role.
 """
 from __future__ import annotations
 
@@ -141,10 +144,11 @@ class RetrievalResult:
 
 
 class HybridRetriever:
-    def __init__(self, db_url: str = DB_URL):
+    def __init__(self, db_url: str = DB_URL, rls_enabled: bool = True):
         self.db_url = db_url
+        self.rls_enabled = rls_enabled
         self._conn: Optional[psycopg2.extensions.connection] = None
-
+    
     # ---- models (module-cached, no torch) ----
     @property
     def embed_model(self) -> TextEmbedding:
@@ -167,8 +171,9 @@ class HybridRetriever:
     ) -> Iterator[psycopg2.extensions.connection]:
         conn = self._ensure_conn()
         try:
-            with conn.cursor() as cur:
-                cur.execute("SET LOCAL app.tenant_id = %s", (tenant_id,))
+            if self.rls_enabled:
+                with conn.cursor() as cur:
+                    cur.execute("SET LOCAL app.tenant_id = %s", (tenant_id,))
             yield conn
             conn.commit()
         except Exception:
@@ -194,12 +199,12 @@ class HybridRetriever:
                     SELECT c.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
                            ts_rank(c.tsv, plainto_tsquery('english', %s)) AS rank
                     FROM chunks c
-                    WHERE c.tenant_id = %s
+                    WHERE c.tenant_id = ANY(%s)
                       AND c.tsv @@ plainto_tsquery('english', %s)
                     ORDER BY rank DESC
                     LIMIT %s
                     """,
-                    (query, tenant_id, query, top_k),
+                    (query, [tenant_id] if self.rls_enabled else ["A", "B", "C"], query, top_k),
                 )
                 rows = cur.fetchall()
 
@@ -234,12 +239,18 @@ class HybridRetriever:
                            1 - (e.vec <=> %s::vector) AS similarity
                     FROM embeddings e
                     JOIN chunks c ON c.chunk_id = e.chunk_id
-                    WHERE c.tenant_id = %s
-                      AND e.tenant_id = %s
+                    WHERE c.tenant_id = ANY(%s)
+                      AND e.tenant_id = ANY(%s)
                     ORDER BY e.vec <=> %s::vector
                     LIMIT %s
                     """,
-                    (vec_str, tenant_id, tenant_id, vec_str, top_k),
+                    (
+                        vec_str,
+                        [tenant_id] if self.rls_enabled else ["A", "B", "C"],
+                        [tenant_id] if self.rls_enabled else ["A", "B", "C"],
+                        vec_str,
+                        top_k,
+                    ),
                 )
                 rows = cur.fetchall()
 
