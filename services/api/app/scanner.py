@@ -43,6 +43,7 @@ def scan_chunks(
         max_length=256,
         return_tensors="pt",
     )
+    inputs.pop("token_type_ids", None)  # DistilBERT has no token-type embeddings
 
     with torch.no_grad():
         probs = torch.softmax(model(**inputs).logits, dim=1)[:, 1].tolist()
