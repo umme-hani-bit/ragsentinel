@@ -37,6 +37,7 @@ services:
       - ./services/retrieval:/app/retrieval:ro
       - ./services/api/app:/app/app:ro
       - ./.model_cache:/models
+      - ./models:/app/models:ro
 
   streamlit:
     build: ./services/streamlit

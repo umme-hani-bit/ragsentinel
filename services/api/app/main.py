@@ -23,6 +23,7 @@ from app.prompting import (
     detect_context_taint,
     parse_llm_json_response,
 )
+from .scanner import scan_chunks
 from app.schemas import Citation, QueryRequest, QueryResponse, ToolCall
 from app.tool_guard import ToolGuardError, intercept_tool_calls
 
@@ -335,6 +336,39 @@ def query_rag(req: QueryRequest) -> QueryResponse:
                     detail="cross_tenant_chunk_in_retrieval_result",
                 )
 
+    # 1b. Injection scanner (per-request defense toggle): filter tainted
+    # chunks from the prompt context and record taint for the tool guard.
+    scanner_enabled = req.defense_profile.injection_scanner_enabled
+    if scanner_enabled:
+        scan_start = time.perf_counter()
+        try:
+            scanned_chunks, scanner_flags = scan_chunks(
+                chunks=raw_chunks,
+                threshold=0.65,
+                enabled=True,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "scanner_unavailable", "message": str(exc)},
+            ) from exc
+        timings["scanner_ms"] = round(
+            (time.perf_counter() - scan_start) * 1000,
+            2,
+        )
+        tainted = [c for c in scanned_chunks if c.get("is_tainted")]
+        kept = [c for c in scanned_chunks if not c.get("is_tainted")]
+        for c in tainted:
+            logger.warning(
+                "injection_scanner_filtered chunk=%s doc=%s prob=%s",
+                c.get("chunk_id"), c.get("doc_id"), c.get("injection_prob"),
+            )
+        raw_chunks = kept
+        timings["scanner_tainted"] = float(len(tainted))
+        timings["scanner_flags_count"] = float(len(scanner_flags))
+    else:
+        scanner_flags = []
+
     contexts = [
         Citation(
             chunk_id=chunk["chunk_id"],
@@ -377,7 +411,7 @@ def query_rag(req: QueryRequest) -> QueryResponse:
     cited_ids = set(parsed.get("citations", []))
     citations = [context for context in contexts if context.chunk_id in cited_ids]
 
-    taint_flags = detect_context_taint(raw_chunks)
+    taint_flags = scanner_flags + detect_context_taint(raw_chunks)
     faithfulness = None
     if req.run_nli_verifier:
         nli_start = time.perf_counter()
@@ -410,10 +444,7 @@ def query_rag(req: QueryRequest) -> QueryResponse:
     safety_notes = parsed.get("safety_notes", "")
     requested_tool_calls = parsed.get("tool_calls", [])
     if requested_tool_calls:
-        defenses = getattr(BUNDLE, "defenses", None)
-        tool_guard_enabled = bool(
-            getattr(defenses, "tool_guard_enabled", False)
-        )
+        tool_guard_enabled = req.defense_profile.tool_guard_enabled
         if tool_guard_enabled:
             guard_start = time.perf_counter()
             try:

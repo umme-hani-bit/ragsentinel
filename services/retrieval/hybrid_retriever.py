@@ -21,7 +21,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional
 
-import psycopg2
+import psycopg2 
+from psycopg2 import sql
 from fastembed import TextEmbedding
 
 
@@ -171,8 +172,9 @@ class HybridRetriever:
     ) -> Iterator[psycopg2.extensions.connection]:
         conn = self._ensure_conn()
         try:
-            if self.rls_enabled:
-                with conn.cursor() as cur:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = '60s'")
+                if self.rls_enabled:
                     cur.execute("SET LOCAL app.tenant_id = %s", (tenant_id,))
             yield conn
             conn.commit()
@@ -185,6 +187,20 @@ class HybridRetriever:
             self._conn.close()
         self._conn = None
 
+    _SQL_TENANTS = ("A", "B", "C")
+
+    def _sql_tenants(self, tenant_id: str) -> List[str]:
+        """Tenants for the SQL predicate, validated against a hard allowlist.
+
+        Values are composed into SQL as literals so the Postgres planner sees
+        constants and picks correct plans; the allowlist makes that safe.
+        """
+        tenants = [tenant_id] if self.rls_enabled else list(self._SQL_TENANTS)
+        for t in tenants:
+            if t not in self._SQL_TENANTS:
+                raise ValueError(f"untrusted tenant_id: {t!r}")
+        return tenants
+    
     # ---- FTS ----
     def fts_search(
         self,
@@ -192,20 +208,24 @@ class HybridRetriever:
         tenant_id: str,
         top_k: int = 20,
     ) -> List[ChunkResult]:
+        tenants_sql = sql.SQL(", ").join(
+            sql.Literal(t) for t in self._sql_tenants(tenant_id)
+        )
+        stmt = sql.SQL(
+            """
+            SELECT c.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
+                   ts_rank(c.tsv, plainto_tsquery('english', %s)) AS rank
+            FROM chunks c
+            WHERE c.tenant_id IN ({tenants})
+              AND c.tsv @@ plainto_tsquery('english', %s)
+            ORDER BY rank DESC
+            LIMIT %s
+            """
+        ).format(tenants=tenants_sql)
+
         with self._tenant_transaction(tenant_id) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT c.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
-                           ts_rank(c.tsv, plainto_tsquery('english', %s)) AS rank
-                    FROM chunks c
-                    WHERE c.tenant_id = ANY(%s)
-                      AND c.tsv @@ plainto_tsquery('english', %s)
-                    ORDER BY rank DESC
-                    LIMIT %s
-                    """,
-                    (query, [tenant_id] if self.rls_enabled else ["A", "B", "C"], query, top_k),
-                )
+                cur.execute(stmt, (query, query, top_k))
                 rows = cur.fetchall()
 
         return [
@@ -231,27 +251,25 @@ class HybridRetriever:
         query_vec = list(self.embed_model.embed([query]))[0].tolist()
         vec_str = "[" + ",".join(f"{value:.8f}" for value in query_vec) + "]"
 
+        tenants_sql = sql.SQL(", ").join(
+            sql.Literal(t) for t in self._sql_tenants(tenant_id)
+        )
+        stmt = sql.SQL(
+            """
+            SELECT e.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
+                   1 - (e.vec <=> %s::vector) AS similarity
+            FROM embeddings e
+            JOIN chunks c ON c.chunk_id = e.chunk_id
+            WHERE c.tenant_id IN ({tenants})
+              AND e.tenant_id IN ({tenants})
+            ORDER BY e.vec <=> %s::vector
+            LIMIT %s
+            """
+        ).format(tenants=tenants_sql)
+
         with self._tenant_transaction(tenant_id) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT e.chunk_id, c.doc_id, c.tenant_id, c.chunk_index, c.text,
-                           1 - (e.vec <=> %s::vector) AS similarity
-                    FROM embeddings e
-                    JOIN chunks c ON c.chunk_id = e.chunk_id
-                    WHERE c.tenant_id = ANY(%s)
-                      AND e.tenant_id = ANY(%s)
-                    ORDER BY e.vec <=> %s::vector
-                    LIMIT %s
-                    """,
-                    (
-                        vec_str,
-                        [tenant_id] if self.rls_enabled else ["A", "B", "C"],
-                        [tenant_id] if self.rls_enabled else ["A", "B", "C"],
-                        vec_str,
-                        top_k,
-                    ),
-                )
+                cur.execute(stmt, (vec_str, vec_str, top_k))
                 rows = cur.fetchall()
 
         return [
@@ -319,10 +337,19 @@ class HybridRetriever:
         try:
             results = list(model.rerank(query, texts))
             scores = [0.0] * len(candidates)
-            for result in results:
-                index = int(getattr(result, "index"))
-                if 0 <= index < len(candidates):
-                    scores[index] = float(getattr(result, "score"))
+
+            # fastembed changed return format: handle both
+            if results and isinstance(results[0], (int, float)):
+                # New format: list of scores (order matches input)
+                for i, score in enumerate(results):
+                    if i < len(candidates):
+                        scores[i] = float(score)
+            else:
+                # Old format: objects with .index and .score
+                for result in results:
+                    index = int(getattr(result, "index"))
+                    if 0 <= index < len(candidates):
+                        scores[index] = float(getattr(result, "score"))
         except Exception as exc:
             print(
                 f"[warn] rerank failed, using heuristic: "
