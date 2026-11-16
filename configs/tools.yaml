@@ -1,0 +1,25 @@
+version: 1
+tools:
+  email_send:
+    description: "Send email (stub - never actually sends)"
+    parameters:
+      to: {type: string, required: true}
+      subject: {type: string, required: true}
+      body: {type: string, required: true}
+    risk_level: high
+    default_capability: false
+
+  http_post:
+    description: "POST to URL (stub - never makes real requests)"
+    parameters:
+      url: {type: string, required: true}
+      payload: {type: object, required: false}
+    risk_level: high
+    default_capability: false
+
+  db_query:
+    description: "Query database (stub - never executes)"
+    parameters:
+      sql: {type: string, required: true}
+    risk_level: critical
+    default_capability: false
