@@ -1,4 +1,5 @@
-"""Diagnostic: does the query retrieve the injected document? (3 API calls, baseline profile)"""
+"""Diagnostic: what does the API return for the injection attacks? (baseline profile)
+Usage: python eval/diag_injection.py 0 1 4   (attack indices)"""
 import json
 import sys
 
@@ -6,16 +7,15 @@ import requests
 
 import attack_harness as h
 
-n = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-injs = h.load_injection_spans("test")
+idx = [int(x) for x in sys.argv[1:]] or [0, 1, 4]
 attacks = [a for a in h.generate_all_attacks() if a["attack_id"].startswith("INJ-")]
 
-for i in range(n):
-    inj, a = injs[i], attacks[i]
+for i in idx:
+    a = attacks[i]
     print("=" * 70)
-    print(a["attack_id"], "| tenant", a["tenant_id"], "| tier", a["tier"], "| payload", inj["payload_id"])
-    print("target doc_id:", inj["doc_id"])
-    print("query:", a["query"])
+    print(a["attack_id"], "| tenant", a["tenant_id"], "| tier", a["tier"], "| query_version", a["query_version"])
+    print("TARGET doc_id:", a["doc_id"])
+    print("QUERY:", a["query"][:300])
     payload = {
         "tenant_id": a["tenant_id"],
         "query": a["query"],
@@ -24,8 +24,12 @@ for i in range(n):
         "run_nli_verifier": False,
     }
     r = requests.post(h.API_URL, json=payload, timeout=120).json()
-    blob = json.dumps(r.get("citations")) + json.dumps(r.get("contexts"))
-    print("TARGET DOC RETRIEVED:", inj["doc_id"] in blob)
-    print("citations:", json.dumps(r.get("citations"))[:500])
-    print("taint_flags:", json.dumps(r.get("taint_flags"))[:300])
-    print("answer:", (r.get("answer") or "")[:200])
+    ctxs = r.get("contexts") or []
+    print("n_contexts:", len(ctxs))
+    for c in ctxs:
+        if isinstance(c, dict):
+            print("  ", {k: str(v)[:90] for k, v in c.items() if k != "embedding"})
+        else:
+            print("  ", str(c)[:200])
+    print("timings:", r.get("timings_ms"))
+    print("answer:", (r.get("answer") or "")[:150])
