@@ -20,7 +20,6 @@ services:
       RAGSENTINEL_BENCHMARK_MODE: "1"
       DATABASE_URL: postgresql://ragsvc:ragsvc@db:5432/ragsentinel
       CONFIG_DIR: /app/configs
-      EVAL_DIR: /app/eval
       PYTHONPATH: /app
       HF_HOME: /models/hf
       FASTEMBED_CACHE_PATH: /models/fastembed
@@ -35,7 +34,6 @@ services:
       - db
     volumes:
       - ./configs:/app/configs:ro
-      - ./eval:/app/eval:ro
       - ./services/retrieval:/app/retrieval:ro
       - ./services/api/app:/app/app:ro
       - ./.model_cache:/models
@@ -47,12 +45,14 @@ services:
     environment:
       API_BASE_URL: http://api:8000
       CONFIG_DIR: /app/configs
+      EVAL_DIR: /app/eval
     ports:
       - "8501:8501"
     depends_on:
       - api
     volumes:
       - ./configs:/app/configs:ro
+      - ./eval:/app/eval:ro
 
 volumes:
   pgdata:
